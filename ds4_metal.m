@@ -167,6 +167,11 @@ static NSUInteger g_attn_out_group_ids_bytes;
 static int g_initialized;
 static int g_quality_mode;
 
+static int ds4_metal_stream_experts_enabled(void) {
+    const char *env = getenv("DS4_METAL_STREAM_EXPERTS");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 #define DS4_METAL_MAX_MODEL_VIEWS 16
 #define DS4_METAL_MODEL_MAX_TENSOR_BYTES 704643072ull
 
@@ -350,7 +355,11 @@ static void ds4_metal_model_residency_clear(void) {
 }
 
 static int ds4_metal_model_residency_request_views(void) {
-    if (g_model_view_count == 0 || getenv("DS4_METAL_NO_RESIDENCY") != NULL) return 1;
+    if (g_model_view_count == 0 ||
+        getenv("DS4_METAL_NO_RESIDENCY") != NULL ||
+        ds4_metal_stream_experts_enabled()) {
+        return 1;
+    }
 
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
@@ -472,9 +481,10 @@ static int ds4_metal_map_model_views(
     }
 
     const double t_mapped = ds4_metal_now_ms();
-    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL;
+    const int request_residency = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
+                                  !ds4_metal_stream_experts_enabled();
     if (request_residency) ds4_metal_progress_begin("requesting Metal residency (may take tens of seconds)");
-    if (!ds4_metal_model_residency_request_views()) {
+    if (request_residency && !ds4_metal_model_residency_request_views()) {
         if (request_residency) ds4_metal_progress_failed();
         return 0;
     }
@@ -483,6 +493,7 @@ static int ds4_metal_map_model_views(
     int warmed = 1;
     const double t_warm0 = ds4_metal_now_ms();
     const int warm_model_views = getenv("DS4_METAL_NO_RESIDENCY") == NULL &&
+                                 !ds4_metal_stream_experts_enabled() &&
                                  getenv("DS4_METAL_NO_MODEL_WARMUP") == NULL;
     if (warm_model_views) {
         /*
@@ -500,6 +511,10 @@ static int ds4_metal_map_model_views(
         else ds4_metal_progress_failed();
     }
     const double t_warm = ds4_metal_now_ms();
+    if (ds4_metal_stream_experts_enabled()) {
+        fprintf(stderr,
+                "ds4: Metal streamed expert mode enabled; full model residency and warmup skipped\n");
+    }
     fprintf(stderr,
             "ds4: Metal model views created in %.3f ms, residency requested in %.3f ms, warmup %.3f ms (mapped %.2f MiB from offset %.2f MiB)\n",
             t_mapped - t0,
@@ -4343,6 +4358,17 @@ int ds4_metal_set_model_map_range(const void *model_map, uint64_t model_size, ui
     if (map_offset > model_size || map_size == 0 || map_size > model_size - map_offset) return 0;
 
     @autoreleasepool {
+        if (ds4_metal_stream_experts_enabled()) {
+            ds4_metal_model_residency_clear();
+            g_model_map_ptr = model_map;
+            g_model_map_size = model_size;
+            g_model_mapped_offset = map_offset;
+            g_model_mapped_size = map_size;
+            fprintf(stderr,
+                    "ds4: Metal streamed model mapping enabled; model range will be wrapped per tensor\n");
+            return 1;
+        }
+
         for (uint32_t i = 0; i < g_model_view_count; i++) {
             if (g_model_views[i].model_map == model_map &&
                 g_model_views[i].model_size == model_size &&
@@ -4378,10 +4404,37 @@ static id<MTLBuffer> ds4_metal_wrap_model_range(
         uint64_t    offset,
         uint64_t    len,
         uint64_t   *inner_offset) {
-    (void)model_map;
     if (model_size == 0 || offset > model_size || len > model_size - offset) {
         fprintf(stderr, "ds4: Metal model range is outside the mapped model\n");
         return nil;
+    }
+
+    if (ds4_metal_stream_experts_enabled()) {
+        const uint64_t page = (uint64_t)getpagesize();
+        const uint64_t page_offset = offset & ~(page - 1u);
+        const uint64_t leading = offset - page_offset;
+        const uint64_t view_bytes = leading + len;
+        if (page_offset > model_size || view_bytes > model_size - page_offset ||
+            view_bytes > (uint64_t)NSUIntegerMax) {
+            fprintf(stderr, "ds4: streamed Metal model range is outside the mapped model\n");
+            return nil;
+        }
+
+        id<MTLBuffer> buffer = [g_device newBufferWithBytesNoCopy:(void *)((uintptr_t)model_map + page_offset)
+                                                           length:(NSUInteger)view_bytes
+                                                          options:MTLResourceStorageModeShared
+                                                      deallocator:nil];
+        if (!buffer) {
+            fprintf(stderr,
+                    "ds4: Metal could not wrap streamed model range at %.2f GiB, size %.2f MiB\n",
+                    ds4_metal_gib(page_offset),
+                    ds4_metal_mib(view_bytes));
+            return nil;
+        }
+        buffer.label = @"ds4_streamed_model_range";
+        [g_transient_buffers addObject:buffer];
+        *inner_offset = leading;
+        return buffer;
     }
 
     const uint64_t end = offset + len;
@@ -4403,6 +4456,130 @@ static id<MTLBuffer> ds4_metal_wrap_model_range(
             ds4_metal_gib(offset),
             ds4_metal_gib(end));
     return nil;
+}
+
+typedef struct {
+    __unsafe_unretained id<MTLBuffer> gate_buf;
+    __unsafe_unretained id<MTLBuffer> up_buf;
+    __unsafe_unretained id<MTLBuffer> down_buf;
+    __unsafe_unretained id<MTLBuffer> selected_buf;
+    NSUInteger gate_inner;
+    NSUInteger up_inner;
+    NSUInteger down_inner;
+    NSUInteger selected_inner;
+    uint32_t n_staged;
+    int had_batch;
+} ds4_metal_streamed_experts;
+
+static id<MTLBuffer> ds4_metal_stage_expert_tensor(
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        base_offset,
+        uint64_t        expert_bytes,
+        const uint32_t *expert_ids,
+        uint32_t        n_experts,
+        const char     *label) {
+    if (!model_map || expert_bytes == 0 || n_experts == 0) return nil;
+    if (expert_bytes > UINT64_MAX / n_experts) return nil;
+    const uint64_t total_bytes = expert_bytes * (uint64_t)n_experts;
+    if (total_bytes > (uint64_t)NSUIntegerMax) return nil;
+
+    id<MTLBuffer> buf = ds4_metal_new_transient_buffer((NSUInteger)total_bytes, label);
+    if (!buf) return nil;
+    uint8_t *dst = (uint8_t *)[buf contents];
+    const uint8_t *src = (const uint8_t *)model_map;
+    for (uint32_t i = 0; i < n_experts; i++) {
+        const uint64_t src_off = base_offset + (uint64_t)expert_ids[i] * expert_bytes;
+        if (src_off > model_size || expert_bytes > model_size - src_off) {
+            fprintf(stderr, "ds4: streamed expert source range is outside the mapped model\n");
+            return nil;
+        }
+        memcpy(dst + (uint64_t)i * expert_bytes, src + src_off, (size_t)expert_bytes);
+    }
+    return buf;
+}
+
+static int ds4_metal_prepare_streamed_experts(
+        ds4_metal_streamed_experts *st,
+        const void                 *model_map,
+        uint64_t                    model_size,
+        uint64_t                    gate_offset,
+        uint64_t                    up_offset,
+        uint64_t                    down_offset,
+        uint64_t                    gate_expert_bytes,
+        uint64_t                    down_expert_bytes,
+        const ds4_metal_tensor     *selected,
+        uint32_t                    n_expert,
+        uint32_t                    n_tokens) {
+    memset(st, 0, sizeof(*st));
+    if (!ds4_metal_stream_experts_enabled()) return 1;
+    if (!model_map || !selected || n_expert == 0 || n_tokens == 0) return 0;
+
+    st->had_batch = g_batch_cb != nil;
+    if (!ds4_metal_synchronize()) return 0;
+
+    id<MTLBuffer> selected_src_buf = ds4_metal_tensor_buffer(selected);
+    if (!selected_src_buf) return 0;
+    const uint64_t selected_count = (uint64_t)n_tokens * n_expert;
+    if (selected_count > SIZE_MAX / sizeof(int32_t) ||
+        ds4_metal_tensor_bytes(selected) < selected_count * sizeof(int32_t)) {
+        return 0;
+    }
+
+    const int32_t *selected_src =
+        (const int32_t *)((const uint8_t *)[selected_src_buf contents] +
+                         ds4_metal_tensor_offset(selected));
+    uint32_t unique[256];
+    uint32_t n_unique = 0;
+    int32_t *remapped = malloc((size_t)selected_count * sizeof(remapped[0]));
+    if (!remapped) return 0;
+
+    for (uint64_t i = 0; i < selected_count; i++) {
+        const int32_t expert = selected_src[i];
+        if (expert < 0 || expert >= 256) {
+            free(remapped);
+            fprintf(stderr, "ds4: router selected invalid expert id %d\n", expert);
+            return 0;
+        }
+        uint32_t slot = 0;
+        while (slot < n_unique && unique[slot] != (uint32_t)expert) slot++;
+        if (slot == n_unique) {
+            if (n_unique == 256) {
+                free(remapped);
+                return 0;
+            }
+            unique[n_unique++] = (uint32_t)expert;
+        }
+        remapped[i] = (int32_t)slot;
+    }
+
+    const uint64_t remap_bytes = selected_count * sizeof(int32_t);
+    st->selected_buf = ds4_metal_new_transient_buffer((NSUInteger)remap_bytes,
+                                                      "ds4_streamed_expert_ids");
+    if (!st->selected_buf) {
+        free(remapped);
+        return 0;
+    }
+    memcpy([st->selected_buf contents], remapped, (size_t)remap_bytes);
+    free(remapped);
+
+    st->gate_buf = ds4_metal_stage_expert_tensor(model_map, model_size, gate_offset,
+                                                 gate_expert_bytes, unique, n_unique,
+                                                 "ds4_streamed_gate_experts");
+    st->up_buf = ds4_metal_stage_expert_tensor(model_map, model_size, up_offset,
+                                               gate_expert_bytes, unique, n_unique,
+                                               "ds4_streamed_up_experts");
+    st->down_buf = ds4_metal_stage_expert_tensor(model_map, model_size, down_offset,
+                                                 down_expert_bytes, unique, n_unique,
+                                                 "ds4_streamed_down_experts");
+    if (!st->gate_buf || !st->up_buf || !st->down_buf) return 0;
+
+    st->gate_inner = 0;
+    st->up_inner = 0;
+    st->down_inner = 0;
+    st->selected_inner = 0;
+    st->n_staged = n_unique;
+    return 1;
 }
 
 int ds4_metal_indexer_score_one_tensor(
@@ -12653,6 +12830,7 @@ int ds4_metal_routed_moe_one_tensor(
         id<MTLBuffer> expertsbuf = ds4_metal_tensor_buffer(experts);
         id<MTLBuffer> selectedbuf = ds4_metal_tensor_buffer(selected);
         id<MTLBuffer> weightsbuf = ds4_metal_tensor_buffer(weights);
+        NSUInteger selected_off = ds4_metal_tensor_offset(selected);
         const uint64_t x_bytes = (uint64_t)expert_in_dim * sizeof(float);
         const uint64_t mid_bytes = (uint64_t)n_expert * expert_mid_dim * sizeof(float);
         const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
@@ -12679,9 +12857,39 @@ int ds4_metal_routed_moe_one_tensor(
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
-        id<MTLBuffer> gate_buf = ds4_metal_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
-        id<MTLBuffer> up_buf = ds4_metal_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
-        id<MTLBuffer> down_buf = ds4_metal_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        uint32_t weight_experts = 256u;
+        ds4_metal_streamed_experts streamed;
+        if (!ds4_metal_prepare_streamed_experts(&streamed,
+                                                model_map,
+                                                model_size,
+                                                gate_offset,
+                                                up_offset,
+                                                down_offset,
+                                                gate_expert_bytes,
+                                                down_expert_bytes,
+                                                selected,
+                                                n_expert,
+                                                1)) {
+            return 0;
+        }
+        id<MTLBuffer> gate_buf = nil;
+        id<MTLBuffer> up_buf = nil;
+        id<MTLBuffer> down_buf = nil;
+        if (streamed.n_staged != 0) {
+            gate_buf = streamed.gate_buf;
+            up_buf = streamed.up_buf;
+            down_buf = streamed.down_buf;
+            gate_inner = streamed.gate_inner;
+            up_inner = streamed.up_inner;
+            down_inner = streamed.down_inner;
+            selectedbuf = streamed.selected_buf;
+            selected_off = streamed.selected_inner;
+            weight_experts = streamed.n_staged;
+        } else {
+            gate_buf = ds4_metal_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
+            up_buf = ds4_metal_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
+            down_buf = ds4_metal_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        }
         if (!gate_buf || !up_buf || !down_buf) return 0;
 
         const uint32_t n_tokens = 1;
@@ -12706,11 +12914,11 @@ int ds4_metal_routed_moe_one_tensor(
         }
 
         ds4_metal_mul_mv_id_args gate_args =
-            ds4_metal_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_metal_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, weight_experts,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_metal_mul_mv_id_args down_args =
-            ds4_metal_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_metal_make_mul_mv_id_args(expert_mid_dim, out_dim, weight_experts,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
 
@@ -12762,7 +12970,7 @@ int ds4_metal_routed_moe_one_tensor(
                                                         midbuf,
                                                         ds4_metal_tensor_offset(mid),
                                                         selectedbuf,
-                                                        ds4_metal_tensor_offset(selected),
+                                                        selected_off,
                                                         weightsbuf,
                                                         ds4_metal_tensor_offset(weights),
                                                         gate_smem,
@@ -12785,7 +12993,7 @@ int ds4_metal_routed_moe_one_tensor(
                                                  upbuf,
                                                  ds4_metal_tensor_offset(up),
                                                  selectedbuf,
-                                                 ds4_metal_tensor_offset(selected),
+                                                 selected_off,
                                                  gate_smem,
                                                  2,
                                                  false);
@@ -12806,7 +13014,7 @@ int ds4_metal_routed_moe_one_tensor(
                                                  upbuf,
                                                  ds4_metal_tensor_offset(up),
                                                  selectedbuf,
-                                                 ds4_metal_tensor_offset(selected),
+                                                 selected_off,
                                                  gate_smem,
                                                  2,
                                                  false);
@@ -12821,7 +13029,7 @@ int ds4_metal_routed_moe_one_tensor(
                                             gatebuf,
                                             ds4_metal_tensor_offset(gate),
                                             selectedbuf,
-                                            ds4_metal_tensor_offset(selected),
+                                            selected_off,
                                             gate_smem,
                                             2,
                                             false) &&
@@ -12835,7 +13043,7 @@ int ds4_metal_routed_moe_one_tensor(
                                             upbuf,
                                             ds4_metal_tensor_offset(up),
                                             selectedbuf,
-                                            ds4_metal_tensor_offset(selected),
+                                            selected_off,
                                             gate_smem,
                                             2,
                                             false);
@@ -12881,7 +13089,7 @@ int ds4_metal_routed_moe_one_tensor(
                                                  outbuf,
                                                  ds4_metal_tensor_offset(out),
                                                  selectedbuf,
-                                                 ds4_metal_tensor_offset(selected),
+                                                 selected_off,
                                                  down_smem,
                                                  2);
         } else if (ok) {
@@ -12895,7 +13103,7 @@ int ds4_metal_routed_moe_one_tensor(
                                                  down_dst,
                                                  down_dst_off,
                                                  selectedbuf,
-                                                 ds4_metal_tensor_offset(selected),
+                                                 selected_off,
                                                  down_smem,
                                                  2,
                                                  false);
@@ -12913,6 +13121,7 @@ int ds4_metal_routed_moe_one_tensor(
         if (!ok) return 0;
 
         if (!ds4_metal_finish_command_buffer(cb, owned, "routed tensor MoE")) return 0;
+        if (streamed.had_batch && !ds4_metal_begin_commands()) return 0;
     }
 
     return 1;
@@ -12960,6 +13169,7 @@ int ds4_metal_routed_moe_batch_tensor(
         id<MTLBuffer> expertsbuf = ds4_metal_tensor_buffer(experts);
         id<MTLBuffer> selectedbuf = ds4_metal_tensor_buffer(selected);
         id<MTLBuffer> weightsbuf = ds4_metal_tensor_buffer(weights);
+        NSUInteger selected_off = ds4_metal_tensor_offset(selected);
         const uint64_t x_bytes = (uint64_t)n_tokens * expert_in_dim * sizeof(float);
         const uint64_t mid_bytes = (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
         const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
@@ -12988,9 +13198,39 @@ int ds4_metal_routed_moe_batch_tensor(
         uint64_t gate_inner = 0;
         uint64_t up_inner = 0;
         uint64_t down_inner = 0;
-        id<MTLBuffer> gate_buf = ds4_metal_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
-        id<MTLBuffer> up_buf = ds4_metal_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
-        id<MTLBuffer> down_buf = ds4_metal_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        uint32_t weight_experts = 256u;
+        ds4_metal_streamed_experts streamed;
+        if (!ds4_metal_prepare_streamed_experts(&streamed,
+                                                model_map,
+                                                model_size,
+                                                gate_offset,
+                                                up_offset,
+                                                down_offset,
+                                                gate_expert_bytes,
+                                                down_expert_bytes,
+                                                selected,
+                                                n_expert,
+                                                n_tokens)) {
+            return 0;
+        }
+        id<MTLBuffer> gate_buf = nil;
+        id<MTLBuffer> up_buf = nil;
+        id<MTLBuffer> down_buf = nil;
+        if (streamed.n_staged != 0) {
+            gate_buf = streamed.gate_buf;
+            up_buf = streamed.up_buf;
+            down_buf = streamed.down_buf;
+            gate_inner = streamed.gate_inner;
+            up_inner = streamed.up_inner;
+            down_inner = streamed.down_inner;
+            selectedbuf = streamed.selected_buf;
+            selected_off = streamed.selected_inner;
+            weight_experts = streamed.n_staged;
+        } else {
+            gate_buf = ds4_metal_wrap_model_range(model_map, model_size, gate_offset, gate_tensor_bytes, &gate_inner);
+            up_buf = ds4_metal_wrap_model_range(model_map, model_size, up_offset, gate_tensor_bytes, &up_inner);
+            down_buf = ds4_metal_wrap_model_range(model_map, model_size, down_offset, down_tensor_bytes, &down_inner);
+        }
         if (!gate_buf || !up_buf || !down_buf) return 0;
 
         const uint32_t pair_rows = n_tokens * n_expert;
@@ -13016,11 +13256,11 @@ int ds4_metal_routed_moe_batch_tensor(
         }
 
         ds4_metal_mul_mv_id_args gate_args =
-            ds4_metal_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, 256,
+            ds4_metal_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, weight_experts,
                                           gate_row_bytes, gate_expert_bytes,
                                           1, n_expert, n_tokens, gate_nr0);
         ds4_metal_mul_mv_id_args down_args =
-            ds4_metal_make_mul_mv_id_args(expert_mid_dim, out_dim, 256,
+            ds4_metal_make_mul_mv_id_args(expert_mid_dim, out_dim, weight_experts,
                                           down_row_bytes, down_expert_bytes,
                                           n_expert, n_expert, n_tokens, down_nr0);
         const bool use_mm_id = n_tokens >= 32u && ds4_metal_mul_mm_id_map0_name(n_expert) != NULL;
@@ -13055,13 +13295,13 @@ int ds4_metal_routed_moe_batch_tensor(
             !g_quality_mode && getenv("DS4_METAL_MOE_MID_F32") == NULL;
         if (use_mm_id) {
             gate_map_args =
-                ds4_metal_make_mul_mm_id_map_args(expert_in_dim, 256, 1, n_expert, n_tokens);
+                ds4_metal_make_mul_mm_id_map_args(expert_in_dim, weight_experts, 1, n_expert, n_tokens);
             gate_mm_args =
-                ds4_metal_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, 256,
+                ds4_metal_make_mul_mm_id_args(expert_in_dim, expert_mid_dim, weight_experts,
                                               gate_row_bytes, gate_expert_bytes,
                                               1, n_expert, n_tokens);
             down_mm_args =
-                ds4_metal_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, 256,
+                ds4_metal_make_mul_mm_id_args_src1_size(expert_mid_dim, out_dim, weight_experts,
                                                         down_row_bytes, down_expert_bytes,
                                                         n_expert, n_expert, n_tokens,
                                                         request_mid_f16 ? sizeof(uint16_t) : sizeof(float));
@@ -13136,7 +13376,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                 &gate_map_args,
                                                 &gate_mm_args,
                                                 selectedbuf,
-                                                ds4_metal_tensor_offset(selected));
+                                                selected_off);
             DS4_METAL_PROFILE_MOE_STAGE("map");
             if (ok) {
                 ok = ds4_metal_encode_mul_mm_id_mapped(cb,
@@ -13181,7 +13421,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                  upbuf,
                                                  ds4_metal_tensor_offset(up),
                                                  selectedbuf,
-                                                 ds4_metal_tensor_offset(selected),
+                                                 selected_off,
                                                  gate_smem,
                                                  2,
                                                  false);
@@ -13196,7 +13436,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                   gatebuf,
                                                   ds4_metal_tensor_offset(gate),
                                                   selectedbuf,
-                                                  ds4_metal_tensor_offset(selected),
+                                                  selected_off,
                                                   gate_smem,
                                                   2,
                                                   false) &&
@@ -13210,7 +13450,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                   upbuf,
                                                   ds4_metal_tensor_offset(up),
                                                   selectedbuf,
-                                                  ds4_metal_tensor_offset(selected),
+                                                  selected_off,
                                                   gate_smem,
                                                   2,
                                                   false);
@@ -13326,7 +13566,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                      outbuf,
                                                      ds4_metal_tensor_offset(out),
                                                      selectedbuf,
-                                                     ds4_metal_tensor_offset(selected),
+                                                     selected_off,
                                                      down_smem,
                                                      2);
             } else if (use_mm_id) {
@@ -13350,7 +13590,7 @@ int ds4_metal_routed_moe_batch_tensor(
                                                      down_dst,
                                                      down_dst_off,
                                                      selectedbuf,
-                                                     ds4_metal_tensor_offset(selected),
+                                                     selected_off,
                                                      down_smem,
                                                      2,
                                                      false);
@@ -13371,6 +13611,7 @@ int ds4_metal_routed_moe_batch_tensor(
         if (!ok) return 0;
 
         if (!ds4_metal_finish_command_buffer(cb, owned, "routed batch MoE")) return 0;
+        if (streamed.had_batch && !ds4_metal_begin_commands()) return 0;
 #undef DS4_METAL_PROFILE_MOE_STAGE
     }
 

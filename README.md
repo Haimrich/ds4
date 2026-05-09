@@ -63,6 +63,13 @@ Download one main model:
 ./download_model.sh q4   # >= 256 GB RAM machines
 ```
 
+Experimental low-memory expert streaming can be enabled with
+`DS4_METAL_STREAM_EXPERTS=1`. In this mode the Metal backend skips whole-model
+residency/warmup and stages only the routed MoE experts selected for the current
+token or prefill batch. This is intended to make q2 startup/runs possible on
+systems below the normal 128 GB target, including 32 GB experiments, but speed
+depends heavily on SSD bandwidth and router locality.
+
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
 updates `./ds4flash.gguf` to point at the selected q2/q4 model. Authentication
